@@ -1,12 +1,4 @@
-# Awesome Local AI
 
-[![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
-[![Star History](https://api.star-history.com/svg?repos=ethicals7s/awesome-local-ai&type=Date)](https://star-history.com/#ethicals7s/awesome-local-ai&Date)
-
-> Curated list of the best **open-source** tools to run, fine-tune, and build with LLMs **100% locally** in 2025–2026  
-> No cloud · No API keys · No censorship — **152 tools with descriptions and growing**
-
-**Star this repo to keep the ultimate local-AI toolbox at hand → updated weekly**
 
 ## One-Click Runners & Installers (15)
 - [Ollama](https://ollama.com) – One-command runner for Llama 3, Gemma, Mistral, etc.
