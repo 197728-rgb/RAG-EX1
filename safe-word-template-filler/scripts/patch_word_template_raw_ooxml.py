@@ -15,8 +15,6 @@ replacement and full report generation. Merged-cell visual-grid label patching i
 reserved for project-specific hardening and is not inferred automatically.
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import json
@@ -26,7 +24,7 @@ import sys
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 TEXT_NODE_RE = re.compile(rb"<w:t(?P<attrs>[^>]*)>(?P<text>.*?)</w:t>", re.DOTALL)
 XML_ESCAPE = {
@@ -43,9 +41,9 @@ class FillEvent:
     field: str
     status: str
     message: str
-    old_value: str | None = None
-    new_value: str | None = None
-    marker: str | None = None
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    marker: Optional[str] = None
 
 
 @dataclass
@@ -121,8 +119,18 @@ def target_cell_guard(value: str) -> bool:
         return False
     if text.endswith(":"):
         return True
+
     lowered = text.casefold()
-    label_words = ["name", "date", "status", "revision", "form", "signature", "approved", "inspector"]
+    label_words = [
+        "name",
+        "date",
+        "status",
+        "revision",
+        "form",
+        "signature",
+        "approved",
+        "inspector",
+    ]
     return len(text) < 80 and any(word in lowered for word in label_words)
 
 
@@ -140,7 +148,15 @@ def build_placeholder_patterns(field: str, mapping: Dict[str, Any]) -> List[byte
     return [p.encode("utf-8") for p in dict.fromkeys(patterns)]
 
 
-def patch_placeholders(document_xml: bytes, evidence: Dict[str, Any], approval_map: Dict[str, Any]) -> Tuple[bytes, List[FillEvent]]:
+def append_event(events: List[FillEvent], **kwargs: Any) -> None:
+    events.append(FillEvent(**kwargs))
+
+
+def patch_placeholders(
+    document_xml: bytes,
+    evidence: Dict[str, Any],
+    approval_map: Dict[str, Any],
+) -> Tuple[bytes, List[FillEvent]]:
     patched = bytearray(document_xml)
     events: List[FillEvent] = []
     fields = approval_map.get("fields") or []
@@ -148,21 +164,41 @@ def patch_placeholders(document_xml: bytes, evidence: Dict[str, Any], approval_m
     for mapping in fields:
         field = mapping.get("field")
         if not field:
-            events.append(FillEvent(field="", status="error", message="Approval-map field entry missing 'field'"))
+            append_event(
+                events,
+                field="",
+                status="error",
+                message="Approval-map field entry missing 'field'",
+            )
             continue
 
         if field not in evidence:
-            events.append(FillEvent(field=field, status="preserved", message="Evidence key missing; original DOCX value preserved"))
+            append_event(
+                events,
+                field=field,
+                status="preserved",
+                message="Evidence key missing; original DOCX value preserved",
+            )
             continue
 
         value = evidence.get(field)
         if value is None:
-            events.append(FillEvent(field=field, status="missing", message="Evidence value is null; original DOCX value preserved"))
+            append_event(
+                events,
+                field=field,
+                status="missing",
+                message="Evidence value is null; original DOCX value preserved",
+            )
             continue
 
         value_text = str(value)
         if not value_text.strip() and not mapping.get("explicit_empty_clears"):
-            events.append(FillEvent(field=field, status="skipped", message="Empty value ignored because explicit_empty_clears is not enabled"))
+            append_event(
+                events,
+                field=field,
+                status="skipped",
+                message="Empty value ignored because explicit_empty_clears is not enabled",
+            )
             continue
 
         replacement = escape_xml_text(value_text)
@@ -174,37 +210,64 @@ def patch_placeholders(document_xml: bytes, evidence: Dict[str, Any], approval_m
             if idx >= 0:
                 old_value = unescape_xml_text(pattern)
                 if target_cell_guard(old_value) and not mapping.get("allow_label_like_target"):
-                    events.append(FillEvent(field=field, status="blocked", message="Target looked label-like/header-like", old_value=old_value, new_value=value_text, marker=old_value))
+                    append_event(
+                        events,
+                        field=field,
+                        status="blocked",
+                        message="Target looked label-like/header-like",
+                        old_value=old_value,
+                        new_value=value_text,
+                        marker=old_value,
+                    )
                     replaced = True
                     break
-                patched[idx : idx + len(pattern)] = replacement
-                events.append(FillEvent(field=field, status="filled", message="Approved placeholder patched", old_value=old_value, new_value=value_text, marker=old_value))
+                patched[idx:idx + len(pattern)] = replacement
+                append_event(
+                    events,
+                    field=field,
+                    status="filled",
+                    message="Approved placeholder patched",
+                    old_value=old_value,
+                    new_value=value_text,
+                    marker=old_value,
+                )
                 replaced = True
                 break
 
         if not replaced:
             label = mapping.get("label")
-            events.append(FillEvent(field=field, status="not_found", message=f"No approved placeholder found; label-grid patching not inferred. label={label!r}"))
+            append_event(
+                events,
+                field=field,
+                status="not_found",
+                message=f"No approved placeholder found; label-grid patching not inferred. label={label!r}",
+            )
 
     return bytes(patched), events
 
 
-def copy_docx_with_new_document_xml(input_docx: Path, output_docx: Path, new_document_xml: bytes) -> None:
+def copy_docx_with_new_document_xml(
+    input_docx: Path,
+    output_docx: Path,
+    new_document_xml: bytes,
+) -> None:
     output_docx.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_docx.with_suffix(output_docx.suffix + ".tmp")
-    with zipfile.ZipFile(input_docx, "r") as zin, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename == "word/document.xml":
-                data = new_document_xml
-            zout.writestr(item, data)
+    with zipfile.ZipFile(input_docx, "r") as zin:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "word/document.xml":
+                    data = new_document_xml
+                zout.writestr(item, data)
     shutil.move(str(tmp_path), str(output_docx))
 
 
 def write_fill_csv(path: Path, events: List[FillEvent]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["field", "status", "message", "old_value", "new_value", "marker"]
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["field", "status", "message", "old_value", "new_value", "marker"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for event in events:
             writer.writerow(asdict(event))
@@ -227,6 +290,40 @@ def write_label_debug(path: Path, document_xml: bytes, approval_map: Dict[str, A
     })
 
 
+def validate_evidence_contract(evidence: Any) -> None:
+    if not isinstance(evidence, dict):
+        raise RuntimeError("evidence.json must be a flat JSON object")
+    if any(isinstance(v, (dict, list)) for v in evidence.values()):
+        raise RuntimeError("evidence.json must be flat; nested review metadata is not allowed")
+
+
+def write_failure_reports(
+    report_dir: Path,
+    document_xml: bytes,
+    approval_map: Dict[str, Any],
+    text_nodes_before: int,
+    errors: List[str],
+) -> None:
+    events = [FillEvent(field="__form__", status="error", message=err) for err in errors]
+    write_json(report_dir / "fill_report.json", [asdict(event) for event in events])
+    write_fill_csv(report_dir / "fill_report.csv", events)
+    write_label_debug(report_dir / "label_debug_dump.json", document_xml, approval_map)
+    guard = StructureGuard(
+        False,
+        len(document_xml),
+        len(document_xml),
+        text_nodes_before,
+        text_nodes_before,
+        0,
+        0,
+        0,
+        True,
+        True,
+        errors,
+    )
+    write_json(report_dir / "structure_guard_report.json", guard.to_json())
+
+
 def run(args: argparse.Namespace) -> int:
     input_docx = Path(args.input_docx)
     evidence_path = Path(args.evidence_json)
@@ -236,34 +333,25 @@ def run(args: argparse.Namespace) -> int:
 
     evidence = load_json(evidence_path)
     approval_map = load_json(approval_map_path)
-
-    if not isinstance(evidence, dict):
-        raise RuntimeError("evidence.json must be a flat JSON object")
-    if any(isinstance(v, (dict, list)) for v in evidence.values()):
-        raise RuntimeError("evidence.json must be flat; nested review metadata is not allowed")
+    validate_evidence_contract(evidence)
 
     document_xml, _package_parts = read_document_xml(input_docx)
     errors = verify_form_markers(document_xml, approval_map)
 
     text_nodes_before = len(TEXT_NODE_RE.findall(document_xml))
     if errors:
-        events = [FillEvent(field="__form__", status="error", message=err) for err in errors]
-        write_json(report_dir / "fill_report.json", [asdict(e) for e in events])
-        write_fill_csv(report_dir / "fill_report.csv", events)
-        write_label_debug(report_dir / "label_debug_dump.json", document_xml, approval_map)
-        guard = StructureGuard(False, len(document_xml), len(document_xml), text_nodes_before, text_nodes_before, 0, 0, 0, True, True, errors)
-        write_json(report_dir / "structure_guard_report.json", guard.to_json())
+        write_failure_reports(report_dir, document_xml, approval_map, text_nodes_before, errors)
         return 2
 
     patched_xml, events = patch_placeholders(document_xml, evidence, approval_map)
     text_nodes_after = len(TEXT_NODE_RE.findall(patched_xml))
     expected_delta = 0
     actual_delta = text_nodes_after - text_nodes_before
-    guard_errors = [e.message for e in events if e.status in {"error", "blocked"}]
+    guard_errors = [event.message for event in events if event.status in {"error", "blocked"}]
     guard_pass = not guard_errors and actual_delta == expected_delta
 
     copy_docx_with_new_document_xml(input_docx, output_docx, patched_xml)
-    write_json(report_dir / "fill_report.json", [asdict(e) for e in events])
+    write_json(report_dir / "fill_report.json", [asdict(event) for event in events])
     write_fill_csv(report_dir / "fill_report.csv", events)
     write_label_debug(report_dir / "label_debug_dump.json", patched_xml, approval_map)
 
@@ -285,7 +373,8 @@ def run(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Safely patch approved DOCX placeholders using flat evidence JSON and an exact approval map.")
+    description = "Safely patch approved DOCX placeholders using flat evidence JSON."
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--input-docx", required=True)
     parser.add_argument("--evidence-json", required=True)
     parser.add_argument("--approval-map", required=True)
@@ -294,7 +383,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     try:
         return run(parse_args(argv or sys.argv[1:]))
     except Exception as exc:
